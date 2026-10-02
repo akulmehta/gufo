@@ -585,6 +585,16 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
+    if (backend->max_context() > 0)
+      model["context_length"] =
+          static_cast<std::size_t>(backend->max_context());
+    model["supports_image_input"] = true;
+    model["supports_vision"] = true;
+    model["supports_tools"] = true;
+    json::Value modalities = json::Value::array();
+    modalities.push_back("text");
+    modalities.push_back("image");
+    model["modalities"] = std::move(modalities);
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {

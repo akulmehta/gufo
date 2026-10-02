@@ -211,6 +211,9 @@ public:
 
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
+  /// Maximum tokens accepted by the loaded model under the configured context.
+  /// Zero when no text model is loaded.
+  [[nodiscard]] virtual std::uint32_t max_context() const { return 0; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }
