@@ -5,19 +5,26 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <iomanip>
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
+#include "src/cli/serve/generation_metrics.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 
 namespace gufo::server {
 namespace {
+
+constexpr std::size_t kDecodeProgressInterval = 50;
 
 struct OutputBudget {
   explicit OutputBudget(std::size_t byte_limit) : limit(byte_limit) {}
@@ -60,10 +67,12 @@ struct ScheduledRequest {
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
   std::size_t cache_prefix_tokens{0};
+  bool stop_at_eos{true};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
   bool publish_token_pieces{false};
+  bool publish_prompt_progress{false};
   TextGenerationScheduler::Clock::time_point request_start;
   std::optional<TextGenerationScheduler::Clock::time_point> deadline;
   std::size_t max_output_bytes{0};
@@ -78,6 +87,9 @@ struct ScheduledRequest {
   std::optional<TextGenerationScheduler::Clock::time_point> previous_token;
   std::chrono::duration<double, std::milli> inter_token_total{0};
   std::size_t inter_token_samples{0};
+  std::size_t last_decode_progress_tokens{0};
+  double last_decode_progress_ms{0.0};
+  std::optional<TextGenerationScheduler::Clock::time_point> prefill_start;
   bool decode_due{false};
   std::optional<TextRunnerToken> preview_token;
   bool advance_pending{false};
@@ -88,7 +100,13 @@ struct ScheduledRequest {
   std::mutex output_mutex;
   std::condition_variable output_condition;
   std::deque<std::string> output_pieces;
+  std::optional<TextGenerationBackend::PromptProgress> pending_progress;
   std::size_t buffered_output_bytes{0};
+  // A stalled consumer trips backpressure on every token, so the debug line is
+  // written once per request. Only the scheduler thread touches this.
+  bool backpressure_logged{false};
+  // Only the scheduler worker changes this, from admission through cleanup.
+  bool counted_processing{false};
   std::exception_ptr failure;
   bool terminal{false};
 };
@@ -120,10 +138,46 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
     }
     request->failure = std::move(failure);
     request->terminal = true;
+    if (std::exchange(request->counted_processing, false)) {
+      detail::RequestsProcessing().fetch_sub(1, std::memory_order_relaxed);
+    }
     request->phase.store(TextRequestPhase::kTerminal,
                          std::memory_order_release);
   }
   request->output_condition.notify_all();
+}
+
+/// Queue cost of one streamed piece. A token whose decoded text is empty still
+/// occupies a queue slot, so it is charged one byte: a zero cost would let an
+/// unbounded number of them accumulate behind a slow consumer.
+[[nodiscard]] std::size_t QueuedPieceCost(std::string_view piece) noexcept {
+  return std::max<std::size_t>(piece.size(), 1);
+}
+
+// Debug-only backpressure line, extracted from the publish path: the fast
+// path needs the `reason.empty()` branch, not fifteen lines of formatting.
+// The once-per-request flag lives on the request; the budgets read here are
+// only ever loaded, never taken, so this runs unlocked after PublishPiece
+// releases output_mutex.
+void LogBackpressure(const std::shared_ptr<ScheduledRequest>& request,
+                     std::string_view reason, std::size_t buffered_bytes,
+                     std::size_t piece_bytes) {
+  if (!Logger::Enabled(LogLevel::kDebug) || request->backpressure_logged) {
+    return;
+  }
+  request->backpressure_logged = true;
+  Logger::Debug("scheduler",
+                "event=backpressure request=" + std::to_string(request->id) +
+                    " reason=" + std::string(reason) +
+                    " buffered_bytes=" + std::to_string(buffered_bytes) +
+                    " piece_bytes=" + std::to_string(piece_bytes) +
+                    " request_limit_bytes=" +
+                    std::to_string(request->max_buffered_output_bytes) +
+                    " total_bytes=" +
+                    std::to_string(request->output_budget->buffered_bytes.load(
+                        std::memory_order_relaxed)) +
+                    " total_limit_bytes=" +
+                    std::to_string(request->output_budget->limit));
 }
 
 [[nodiscard]] bool PublishPiece(
@@ -131,31 +185,68 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
   if (!request->publish_token_pieces) {
     return true;
   }
-  const std::size_t piece_bytes = piece.size();
+  const std::size_t piece_bytes = QueuedPieceCost(piece);
+  std::string_view reason;
+  std::size_t buffered = 0;
   {
     const std::lock_guard<std::mutex> lock(request->output_mutex);
     if (request->buffered_output_bytes > request->max_buffered_output_bytes ||
         piece_bytes > request->max_buffered_output_bytes -
                           request->buffered_output_bytes) {
-      return false;
-    }
-    if (!request->output_budget->TryReserve(piece_bytes)) {
-      return false;
-    }
-    try {
-      request->buffered_output_bytes += piece_bytes;
-      request->result.max_buffered_output_bytes =
-          std::max(request->result.max_buffered_output_bytes,
-                   request->buffered_output_bytes);
-      request->output_pieces.push_back(std::move(piece));
-    } catch (...) {
-      request->output_budget->Release(piece_bytes);
-      request->buffered_output_bytes -= piece_bytes;
-      throw;
+      reason = "request_buffer";
+      buffered = request->buffered_output_bytes;
+    } else if (!request->output_budget->TryReserve(piece_bytes)) {
+      reason = "total_buffer";
+      buffered = request->buffered_output_bytes;
+    } else {
+      try {
+        request->buffered_output_bytes += piece_bytes;
+        request->result.max_buffered_output_bytes =
+            std::max(request->result.max_buffered_output_bytes,
+                     request->buffered_output_bytes);
+        request->output_pieces.push_back(std::move(piece));
+      } catch (...) {
+        request->output_budget->Release(piece_bytes);
+        request->buffered_output_bytes -= piece_bytes;
+        throw;
+      }
     }
   }
+  if (reason.empty()) {
+    request->output_condition.notify_one();
+    return true;
+  }
+  // Reported after releasing output_mutex: the line names which budget refused
+  // the piece, which is the question an operator asks when a stream stalls.
+  LogBackpressure(request, reason, buffered, piece_bytes);
+  return false;
+}
+
+/// Replaces unread progress, so a slow consumer holds at most one update.
+void PublishPromptProgress(const std::shared_ptr<ScheduledRequest>& request) {
+  if (!request->publish_prompt_progress) {
+    return;
+  }
+  const auto now = TextGenerationScheduler::Clock::now();
+  if (!request->prefill_start.has_value()) {
+    request->prefill_start = now;
+  }
+  const std::size_t total = request->result.prompt_tokens;
+  const std::size_t cache =
+      std::min(request->result.cached_prompt_tokens, total);
+  const TextGenerationBackend::PromptProgress progress{
+      .total = total,
+      .cache = cache,
+      .processed = std::min(cache + request->result.prefill_tokens, total),
+      .time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - *request->prefill_start)
+                     .count(),
+  };
+  {
+    const std::lock_guard<std::mutex> lock(request->output_mutex);
+    request->pending_progress = progress;
+  }
   request->output_condition.notify_one();
-  return true;
 }
 
 bool CancellationRequested(const std::shared_ptr<ScheduledRequest>& request) {
@@ -246,6 +337,91 @@ struct TextGenerationScheduler::Impl {
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
 
+  static double TokensPerSecond(std::size_t tokens, double elapsed_ms) {
+    return elapsed_ms > 0.0 ? static_cast<double>(tokens) * 1000.0 / elapsed_ms
+                            : 0.0;
+  }
+
+  void LogPrefillProgress(const std::shared_ptr<ScheduledRequest>& request,
+                          std::size_t chunk_tokens,
+                          double chunk_ms) const noexcept {
+    if (!scheduler_policy.log_progress || !Logger::Enabled(LogLevel::kInfo)) {
+      return;
+    }
+    try {
+      const std::size_t cached = std::min(request->result.cached_prompt_tokens,
+                                          request->result.prompt_tokens);
+      const std::size_t total = request->result.prompt_tokens - cached;
+      const std::size_t processed =
+          std::min(request->result.prefill_tokens, total);
+      const double percentage =
+          total > 0 ? static_cast<double>(processed) * 100.0 / total : 100.0;
+      std::ostringstream message;
+      message << "request=" << request->id
+              << " phase=prefill tokens=" << processed << '/' << total
+              << " percentage=" << std::fixed << std::setprecision(1)
+              << percentage
+              << " chunk_tps=" << TokensPerSecond(chunk_tokens, chunk_ms)
+              << " avg_tps="
+              << TokensPerSecond(request->result.prefill_tokens,
+                                 request->result.prefill_ms);
+      Logger::Info("progress", message.str());
+    } catch (...) {
+    }
+  }
+
+  void LogDecodeProgress(const std::shared_ptr<ScheduledRequest>& request,
+                         bool final = false) const noexcept {
+    if (!scheduler_policy.log_progress || !Logger::Enabled(LogLevel::kInfo)) {
+      return;
+    }
+    const std::size_t generated = request->result.tokens.size();
+    if (generated == 0 || generated == request->last_decode_progress_tokens ||
+        (!final &&
+         generated / kDecodeProgressInterval ==
+             request->last_decode_progress_tokens / kDecodeProgressInterval)) {
+      return;
+    }
+    try {
+      const std::size_t chunk_tokens =
+          generated - request->last_decode_progress_tokens;
+      const double chunk_ms =
+          request->result.decode_ms - request->last_decode_progress_ms;
+      const double percentage =
+          request->token_limit > 0
+              ? static_cast<double>(generated) * 100.0 / request->token_limit
+              : 100.0;
+      std::ostringstream message;
+      message << "request=" << request->id
+              << " phase=decode tokens=" << generated << '/'
+              << request->token_limit << " percentage=" << std::fixed
+              << std::setprecision(1) << percentage
+              << " chunk_tps=" << TokensPerSecond(chunk_tokens, chunk_ms)
+              << " avg_tps="
+              << TokensPerSecond(generated, request->result.decode_ms);
+      if (request->result.draft_tokens > 0) {
+        message << " draft_accepted=" << request->result.draft_accepted_tokens
+                << " draft_proposed=" << request->result.draft_tokens
+                << " acceptance_percentage="
+                << static_cast<double>(request->result.draft_accepted_tokens) *
+                       100.0 / request->result.draft_tokens;
+      }
+      Logger::Info("progress", message.str());
+      request->last_decode_progress_tokens = generated;
+      request->last_decode_progress_ms = request->result.decode_ms;
+    } catch (...) {
+    }
+  }
+
+  /// Keeps the process-wide deferred gauge in step. Requires queue_mutex.
+  void SetQueuedCountLocked(std::size_t count) {
+    detail::RequestsDeferred().fetch_add(
+        static_cast<std::int64_t>(count) -
+            static_cast<std::int64_t>(queued_count),
+        std::memory_order_relaxed);
+    queued_count = count;
+  }
+
   [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
     const std::lock_guard<std::mutex> lock(queue_mutex);
     if (queued_clients.empty()) {
@@ -255,7 +431,11 @@ struct TextGenerationScheduler::Impl {
     queued_clients.pop_front();
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
-    --queued_count;
+    // Admission reserves a session before potentially slow cache preparation.
+    // Publish the transfer before removing it from the deferred count.
+    request->counted_processing = true;
+    detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
+    SetQueuedCountLocked(queued_count - 1);
     if (!client.requests.empty()) {
       queued_clients.push_back(std::move(client));
     }
@@ -273,7 +453,7 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
       client->requests.erase(queued);
-      --queued_count;
+      SetQueuedCountLocked(queued_count - 1);
       if (client->requests.empty()) {
         queued_clients.erase(client);
       }
@@ -321,6 +501,7 @@ struct TextGenerationScheduler::Impl {
       }
       request->result.cancelled = true;
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
+      LogDecodeProgress(request, true);
       PublishTerminal(request, {}, true);
     } catch (...) {
       PublishTerminal(request, std::current_exception(), true);
@@ -333,6 +514,7 @@ struct TextGenerationScheduler::Impl {
       request->runner_request.Invalidate();
     }
     request->result.completion_tokens = request->result.tokens.size();
+    LogDecodeProgress(request, true);
     PublishTerminal(request, std::move(failure), true);
   }
 
@@ -388,6 +570,7 @@ struct TextGenerationScheduler::Impl {
         cache_commit.shared_prefix_bytes;
     request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
     FinalizeResult(request, finish_reason);
+    LogDecodeProgress(request, true);
     PublishTerminal(request);
   }
 
@@ -439,7 +622,7 @@ struct TextGenerationScheduler::Impl {
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context), request->cache_prompt,
-            request->cache_prefix_tokens);
+            request->cache_prefix_tokens, request->stop_at_eos);
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
@@ -466,6 +649,7 @@ struct TextGenerationScheduler::Impl {
                                        .count();
         request->result.resident_requests_at_admission =
             prefilling.size() + decoding.size() + capturing + 1;
+        PublishPromptProgress(request);
         request->phase.store(TextRequestPhase::kAdmitted,
                              std::memory_order_release);
         request->phase.store(request->runner_request.prefill_complete()
@@ -508,13 +692,18 @@ struct TextGenerationScheduler::Impl {
       }
       const auto start = Clock::now();
       const auto step = request->runner_request.Prefill(budget);
-      request->result.prefill_ms +=
+      const double step_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - start)
               .count();
+      request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
+                                            std::memory_order_relaxed);
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
           request->result.max_prefill_chunk_tokens, step.consumed_tokens);
+      LogPrefillProgress(request, step.consumed_tokens, step_ms);
+      PublishPromptProgress(request);
 
       if (decoder_runnable) {
         ++request->result.active_decode_prefill_chunks;
@@ -613,10 +802,12 @@ struct TextGenerationScheduler::Impl {
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
+    detail::TotalGenTokens().fetch_add(1, std::memory_order_relaxed);
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
-    if (!piece.empty() && !PublishPiece(request, piece)) {
+    if ((!piece.empty() || !request->stop_filter.enabled()) &&
+        !PublishPiece(request, piece)) {
       CompleteFailure(request,
                       std::make_exception_ptr(TextGenerationError(
                           TextGenerationErrorCode::kOutputBackpressure,
@@ -639,6 +830,7 @@ struct TextGenerationScheduler::Impl {
     request->result.decode_ms +=
         std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
             .count();
+    LogDecodeProgress(request);
     if (CompleteIfStopped(request)) {
       return;
     }
@@ -701,6 +893,7 @@ struct TextGenerationScheduler::Impl {
       request->result.decode_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
               .count();
+      LogDecodeProgress(request);
       if (request->stop_filter.stopped()) {
         CompleteSuccess(request,
                         TextGenerationBackend::FinishReason::kStopSequence);
@@ -734,6 +927,7 @@ struct TextGenerationScheduler::Impl {
       request->result.decode_ms += std::chrono::duration<double, std::milli>(
                                        Clock::now() - preview_start)
                                        .count();
+      LogDecodeProgress(request);
     }
     if (request->stop_filter.stopped()) {
       CompleteSuccess(request,
@@ -978,6 +1172,7 @@ struct TextGenerationScheduler::Impl {
           std::chrono::duration<double, std::milli>(Clock::now() -
                                                     item.decode_start)
               .count();
+      LogDecodeProgress(item.request);
       if (!published || IsTerminal(item.request)) {
         continue;
       }
@@ -1041,7 +1236,7 @@ struct TextGenerationScheduler::Impl {
                   std::back_inserter(remaining_queued));
       }
       queued_clients.clear();
-      queued_count = 0;
+      SetQueuedCountLocked(0);
     }
     for (const auto& request : remaining_queued) {
       CompleteCancelled(request);
@@ -1236,7 +1431,7 @@ TextRequestPhase TextGenerationScheduler::Request::phase() const noexcept {
 }
 
 TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
-    const TokenCallback& on_token) {
+    const TokenCallback& on_token, const ProgressCallback& on_progress) {
   if (!*this) {
     throw std::logic_error("text scheduler request is empty");
   }
@@ -1253,16 +1448,22 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
 
   while (true) {
     std::string piece;
+    std::optional<TextGenerationBackend::PromptProgress> progress;
+    bool has_piece = false;
     bool terminal = false;
     {
       std::unique_lock<std::mutex> lock(impl_->request->output_mutex);
       impl_->request->output_condition.wait(lock, [&] {
         return impl_->request->terminal ||
+               impl_->request->pending_progress.has_value() ||
                !impl_->request->output_pieces.empty();
       });
-      if (!impl_->request->output_pieces.empty()) {
+      if (impl_->request->pending_progress.has_value()) {
+        progress = std::exchange(impl_->request->pending_progress, {});
+      } else if (!impl_->request->output_pieces.empty()) {
+        has_piece = true;
         const std::size_t piece_bytes =
-            impl_->request->output_pieces.front().size();
+            QueuedPieceCost(impl_->request->output_pieces.front());
         piece = std::move(impl_->request->output_pieces.front());
         impl_->request->output_pieces.pop_front();
         impl_->request->buffered_output_bytes -= piece_bytes;
@@ -1274,9 +1475,9 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
       }
     }
 
-    if (!piece.empty() && deliver_pieces && on_token) {
+    const auto deliver = [&](const auto& callback, const auto& value) {
       try {
-        if (!on_token(piece)) {
+        if (!callback(value)) {
           consumer_cancelled = true;
           deliver_pieces = false;
           Cancel();
@@ -1286,6 +1487,12 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
         deliver_pieces = false;
         Cancel();
       }
+    };
+    if (progress.has_value() && deliver_pieces && on_progress) {
+      deliver(on_progress, *progress);
+    }
+    if (has_piece && deliver_pieces && on_token) {
+      deliver(on_token, piece);
     }
     if (terminal) {
       break;
@@ -1374,6 +1581,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
   request->result.prompt_tokens = prompt.size();
+  request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;
   request->result.configured_active_prefill_tokens =
       impl_->prefill_policy.decode_active_tokens;
@@ -1385,11 +1593,14 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->prompt_context = std::move(metadata.prompt_context);
   request->cache_prompt = metadata.cache_prompt;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;
   request->sampling = sampling;
   request->external_cancellation = is_cancelled;
   request->publish_token_pieces = publish_token_pieces;
+  request->publish_prompt_progress =
+      publish_token_pieces && metadata.return_progress;
   request->request_start = metadata.request_start;
   request->deadline = metadata.deadline;
   if (!request->deadline.has_value() &&
@@ -1403,6 +1614,24 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       impl_->scheduler_policy.max_buffered_output_bytes_per_request;
   request->output_budget = impl_->output_budget;
 
+  // A refusal is reported and thrown after the lock below is released.
+  // Admission-line inputs are snapshotted under the queue mutex and the
+  // messages are assembled after the unlock: the timestamp and stderr write
+  // behind Logger::Debug must not serialize every other Submit() behind this
+  // one. The counters are the only mutable state read; `client_id`, the
+  // limits and the submit depths written below are never rewritten by the
+  // worker thread, and the refused request was never enqueued, so nothing
+  // else can observe them in between.
+  bool refused = false;
+  TextGenerationErrorCode refusal_code = TextGenerationErrorCode::kQueueFull;
+  std::string refusal_message;
+  std::string_view refusal_reason;  // empty when the request was admitted
+  std::size_t decision_queued = 0;
+  std::size_t decision_client_queued = 0;
+  // Snapshot for the admission log: once the block below unlocks, the
+  // scheduler thread owns the request and moves `prompt` out of it, so any
+  // later read of the vector would race even though the shared_ptr survives.
+  std::size_t admitted_prompt_tokens = 0;
   {
     const std::lock_guard<std::mutex> lock(impl_->queue_mutex);
     if (impl_->stopping) {
@@ -1410,33 +1639,79 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
                                 "text generation scheduler is stopping");
     }
     if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
-      throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
-                                "text generation pending queue is full");
+      refused = true;
+      refusal_code = TextGenerationErrorCode::kQueueFull;
+      refusal_message = "text generation pending queue is full";
+      refusal_reason = "queue_full";
+      decision_queued = impl_->queued_count;
+    } else {
+      auto client = std::find_if(
+          impl_->queued_clients.begin(), impl_->queued_clients.end(),
+          [&](const PendingClient& pending) {
+            return pending.client_id == request->client_id;
+          });
+      if (client != impl_->queued_clients.end() &&
+          client->requests.size() >=
+              impl_->scheduler_policy.max_pending_requests_per_client) {
+        refused = true;
+        refusal_code = TextGenerationErrorCode::kClientQueueFull;
+        refusal_message = "text generation client pending queue is full";
+        refusal_reason = "client_quota";
+        decision_queued = impl_->queued_count;
+        decision_client_queued = client->requests.size();
+      } else {
+        if (client == impl_->queued_clients.end()) {
+          impl_->queued_clients.push_back({
+              .client_id = request->client_id,
+              .requests = {},
+          });
+          client = std::prev(impl_->queued_clients.end());
+        }
+        decision_queued = impl_->queued_count + 1;
+        decision_client_queued = client->requests.size() + 1;
+        request->result.queue_depth_at_submit = decision_queued;
+        request->result.client_queue_depth_at_submit = decision_client_queued;
+        admitted_prompt_tokens = request->prompt.size();
+        client->requests.push_back(request);
+        impl_->SetQueuedCountLocked(impl_->queued_count + 1);
+      }
     }
-    auto client =
-        std::find_if(impl_->queued_clients.begin(), impl_->queued_clients.end(),
-                     [&](const PendingClient& pending) {
-                       return pending.client_id == request->client_id;
-                     });
-    if (client != impl_->queued_clients.end() &&
-        client->requests.size() >=
-            impl_->scheduler_policy.max_pending_requests_per_client) {
-      throw TextGenerationError(TextGenerationErrorCode::kClientQueueFull,
-                                "text generation client pending queue is full");
+  }
+  if (refused) {
+    if (Logger::Enabled(LogLevel::kDebug)) {
+      const bool quota = refusal_reason == "client_quota";
+      std::string detail =
+          "event=admission_refused reason=" + std::string(refusal_reason) +
+          " queued=" + std::to_string(decision_queued);
+      if (quota) {
+        detail += " client_queued=" + std::to_string(decision_client_queued);
+      }
+      detail +=
+          " limit=" +
+          std::to_string(
+              quota ? impl_->scheduler_policy.max_pending_requests_per_client
+                    : impl_->scheduler_policy.max_pending_requests) +
+          " client_id=" + request->client_id;
+      Logger::Debug("scheduler", detail);
     }
-    if (client == impl_->queued_clients.end()) {
-      impl_->queued_clients.push_back({
-          .client_id = request->client_id,
-          .requests = {},
-      });
-      client = std::prev(impl_->queued_clients.end());
-    }
-    request->result.queue_depth_at_submit = impl_->queued_count + 1;
-    request->result.client_queue_depth_at_submit = client->requests.size() + 1;
-    client->requests.push_back(request);
-    ++impl_->queued_count;
+    throw TextGenerationError(refusal_code, refusal_message);
   }
   impl_->queue_condition.notify_one();
+  // Emitted after the notification, not between the enqueue and it: these
+  // lines allocate, and a failure there would throw out of Submit for a
+  // request the scheduler is already running. The counters are the locals
+  // snapshotted above; every other value read here is immutable after Submit
+  // set it up, so the worker thread cannot interleave with this line's reads.
+  if (Logger::Enabled(LogLevel::kDebug)) {
+    Logger::Debug(
+        "scheduler",
+        "event=admitted request=" + std::to_string(request->id) +
+            " client_id=" + request->client_id +
+            " queued=" + std::to_string(decision_queued) +
+            " client_queued=" + std::to_string(decision_client_queued) +
+            " prompt_tokens=" + std::to_string(admitted_prompt_tokens) +
+            " max_tokens=" + std::to_string(request->token_limit));
+  }
   return Request(std::make_unique<Request::Impl>(std::move(request)));
 }
 

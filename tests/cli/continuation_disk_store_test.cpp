@@ -60,12 +60,9 @@ void Expect(bool condition, std::string_view message) {
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
-    std::array<char, 64> pattern{};
-    const std::string base = (std::filesystem::temp_directory_path() /
-                              "gufo-continuation-disk-XXXXXX")
-                                 .string();
-    Expect(base.size() + 1 <= pattern.size(), "temporary path fits buffer");
-    std::copy(base.begin(), base.end(), pattern.begin());
+    std::string pattern = (std::filesystem::temp_directory_path() /
+                           "gufo-continuation-disk-XXXXXX")
+                              .string();
     char* created = ::mkdtemp(pattern.data());
     if (created == nullptr) {
       throw std::runtime_error("failed to create temporary directory");
@@ -739,11 +736,7 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
     output << "must survive";
   }
   const auto unsafe_link = directory.path() / "unsafe.kvc";
-  // Windows needs Developer Mode or elevation to create symlinks; without
-  // one the symlink-specific expectations below are vacuous.
-  std::error_code link_error;
-  std::filesystem::create_symlink(target.filename(), unsafe_link, link_error);
-  const bool have_link = !link_error;
+  std::filesystem::create_symlink(target.filename(), unsafe_link);
 
   std::vector<ContinuationDiskEvent> events;
   ContinuationDiskStore restarted(
@@ -752,9 +745,9 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
   Expect(
       restarted.entry_count() == 2 && CacheFiles(directory.path()).size() == 2,
       "startup indexes only checksum-valid regular entries");
-  Expect(std::filesystem::exists(target) &&
-             (!have_link || !std::filesystem::exists(unsafe_link)),
-         "unsafe symlink is removed without following its target");
+  Expect(
+      std::filesystem::exists(target) && !std::filesystem::exists(unsafe_link),
+      "unsafe symlink is removed without following its target");
   Expect(
       std::ranges::any_of(events,
                           [](const ContinuationDiskEvent& event) {
@@ -767,12 +760,11 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
                 return event.reason ==
                        ContinuationDiskEventReason::kChecksumMismatch;
               }) &&
-          (!have_link || std::ranges::any_of(
-                             events,
-                             [](const ContinuationDiskEvent& event) {
-                               return event.reason ==
-                                      ContinuationDiskEventReason::kUnsafeFile;
-                             })),
+          std::ranges::any_of(events,
+                              [](const ContinuationDiskEvent& event) {
+                                return event.reason ==
+                                       ContinuationDiskEventReason::kUnsafeFile;
+                              }),
       "startup reports sanitized invalid-file reasons");
 
   std::size_t compatible_hits = 0;
@@ -798,14 +790,7 @@ void TestRootSymlinkIsRejected() {
   const auto target = directory.path() / "target";
   const auto link = directory.path() / "cache-link";
   std::filesystem::create_directory(target);
-  std::error_code link_error;
-  std::filesystem::create_directory_symlink(target.filename(), link,
-                                            link_error);
-  if (link_error) {
-    std::cout << "skipping root symlink check: " << link_error.message()
-              << '\n';
-    return;
-  }
+  std::filesystem::create_directory_symlink(target.filename(), link);
   bool rejected = false;
   try {
     ContinuationDiskStore store(StoreOptions(link));
@@ -1118,10 +1103,65 @@ void TestAppendedImagePrefixesSurviveRestart() {
          "moving the first image before the checkpoint invalidates reuse");
 }
 
+void TestMinimumCheckpointStep() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("min-step-model");
+  std::vector<ContinuationDiskEvent> events;
+  auto options = StoreOptions(directory.path());
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(
+      options, [&](const auto& event) { events.push_back(event); });
+
+  Expect(
+      SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2)).stored,
+      "the first checkpoint has no covering prefix and is stored");
+  Expect(store.WithinCheckpointStep(*runner,
+                                    std::vector<TextRunnerToken>{1, 2, 3, 4}) &&
+             !store.WithinCheckpointStep(
+                 *runner, std::vector<TextRunnerToken>{1, 2, 3, 4, 5}) &&
+             !store.WithinCheckpointStep(*runner,
+                                         std::vector<TextRunnerToken>{8, 8}),
+         "callers can skip a capture the step would discard");
+  Expect(!SaveTokens(store, *runner, {1, 2, 3, 4}, *MakeSnapshot(*runner, 2, 4))
+                 .stored &&
+             events.back().reason == ContinuationDiskEventReason::kMinStep,
+         "a checkpoint less than one step past a stored prefix is skipped");
+  Expect(
+      SaveTokens(store, *runner, {9, 9}, *MakeSnapshot(*runner, 3, 2)).stored,
+      "an unrelated checkpoint is not covered by another prompt");
+  Expect(
+      SaveTokens(store, *runner, {1, 2, 3, 4, 5}, *MakeSnapshot(*runner, 4, 5))
+          .stored,
+      "a checkpoint one full step past the prefix is stored");
+
+  Expect(store.SaveAsync(runner, {1, 2, 3, 4, 5, 6},
+                         MakeSnapshot(*runner, 5, 6), {}, {},
+                         /*shared_prefix=*/true) != 0,
+         "a shared prefix is queued");
+  store.Flush();
+  auto state = runner->CreateState();
+  Expect(
+      RestoreTokens(store, *runner, *state, {1, 2, 3, 4, 5, 6, 7}).restored &&
+          RequireFakeState(*state).value == 5,
+      "shared prefixes are exempt from the step");
+
+  options.min_checkpoint_step_tokens = 0;
+  TemporaryDirectory ungated_directory;
+  options.directory = ungated_directory.path();
+  ContinuationDiskStore ungated(options);
+  Expect(
+      SaveTokens(ungated, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2))
+              .stored &&
+          SaveTokens(ungated, *runner, {1, 2, 3}, *MakeSnapshot(*runner, 2, 3))
+              .stored,
+      "zero disables the step");
+}
+
 int main() {
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();
+  TestMinimumCheckpointStep();
   TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
