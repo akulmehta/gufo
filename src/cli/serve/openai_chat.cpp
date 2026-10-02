@@ -2345,15 +2345,17 @@ HttpResponse StreamingResponse(
               error["error"] = std::move(detail);
               stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
               stream_log->error_code = "generation_failed";
-              json::Value error = json::Value::object();
+              json::Value err = json::Value::object();
               json::Value detail = json::Value::object();
-              detail["message"] = "generation failed";
+              detail["message"] = error.what() && std::strlen(error.what()) > 0
+                                      ? error.what()
+                                      : "generation failed";
               detail["type"] = "server_error";
               detail["code"] = "generation_failed";
-              error["error"] = std::move(detail);
-              stream_log->error_event_sent = writer(Sse(error));
+              err["error"] = std::move(detail);
+              stream_log->error_event_sent = writer(Sse(err));
               (void)writer("data: [DONE]\n\n");
             }
           },
@@ -2614,8 +2616,10 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       stream_log->error_code = generation_error
                                    ? generation_error->stable_code()
                                    : "generation_failed";
-      stream_log->error_event_sent =
-          output.Fail(generation_error ? error.what() : "generation failed");
+      stream_log->error_event_sent = output.Fail(
+          error.what() && std::strlen(error.what()) > 0
+              ? error.what()
+              : (generation_error ? error.what() : "generation failed"));
       generation->Cancel();
       return json::Value();
     }

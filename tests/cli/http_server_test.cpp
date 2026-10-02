@@ -966,8 +966,7 @@ void TestRawCompletionStreaming() {
       R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":true}})");
   ExpectStatus(failed, 200);
   assert(failed.find("\"code\":\"generation_failed\"") != std::string::npos);
-  assert(failed.find("\"message\":\"generation failed\"") != std::string::npos);
-  assert(failed.find("context exceeded") == std::string::npos);
+  assert(failed.find("\"message\":\"context exceeded\"") != std::string::npos);
   assert(failed.find("data: [DONE]\n\n") != std::string::npos);
   server.backend->failure = 0;
 
