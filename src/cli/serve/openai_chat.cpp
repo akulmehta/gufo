@@ -2349,9 +2349,9 @@ HttpResponse StreamingResponse(
               stream_log->error_code = "generation_failed";
               json::Value err = json::Value::object();
               json::Value detail = json::Value::object();
-              detail["message"] = error.what() && std::strlen(error.what()) > 0
-                                      ? error.what()
-                                      : "generation failed";
+              const char* message = error.what();
+              detail["message"] =
+                  message && *message ? message : "generation failed";
               detail["type"] = "server_error";
               detail["code"] = "generation_failed";
               err["error"] = std::move(detail);
@@ -2616,10 +2616,9 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       stream_log->error_code = generation_error
                                    ? generation_error->stable_code()
                                    : "generation_failed";
-      stream_log->error_event_sent = output.Fail(
-          error.what() && std::strlen(error.what()) > 0
-              ? error.what()
-              : (generation_error ? error.what() : "generation failed"));
+      const char* message = error.what();
+      stream_log->error_event_sent =
+          output.Fail(message && *message ? message : "generation failed");
       generation->Cancel();
       return json::Value();
     }
