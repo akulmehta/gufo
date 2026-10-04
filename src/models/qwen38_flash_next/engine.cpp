@@ -1058,6 +1058,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   std::string candidate_error;
   const bool have_candidates =
       sampled && platform::PlatformTuning().fast_sampling &&
+      !sampler.config().constraint &&
       k <= candidates.size() && sampler.config().top_k > 0 &&
       !sampler.config().penalties_enabled() &&
       exec.VerifyCandidates(std::span(candidates).first(k), &candidate_error);

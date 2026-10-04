@@ -622,6 +622,7 @@ std::optional<SamplingDistribution> SamplerState::DistributionFromTop(
     std::size_t vocab) const {
   if (values.size() != ids.size() || values.empty() ||
       config_.temperature == 0 || config_.top_k <= 0 ||
+      config_.constraint != nullptr ||
       !penalty_counts_.empty()) {
     return std::nullopt;
   }
