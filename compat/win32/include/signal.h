@@ -12,6 +12,9 @@ extern "C" {
 #ifndef SIGPIPE
 #define SIGPIPE 13
 #endif
+#ifndef SIGBUS
+#define SIGBUS 7
+#endif
 #ifndef SIGHUP
 #define SIGHUP 1
 #endif
