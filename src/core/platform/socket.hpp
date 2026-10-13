@@ -190,6 +190,27 @@ inline int SetSocketTimeout(int fd, int name,
 #endif
 }
 
+inline std::chrono::microseconds GetSocketTimeout(int fd, int name) noexcept {
+#ifdef _WIN32
+  DWORD ms = 0;
+  int size = sizeof(ms);
+  if (::getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, name,
+                   reinterpret_cast<char*>(&ms), &size) != 0) {
+    return std::chrono::microseconds{0};
+  }
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::milliseconds(ms));
+#else
+  timeval tv{};
+  socklen_t size = sizeof(tv);
+  if (::getsockopt(fd, SOL_SOCKET, name, &tv, &size) != 0) {
+    return std::chrono::microseconds{0};
+  }
+  return std::chrono::seconds(tv.tv_sec) +
+         std::chrono::microseconds(tv.tv_usec);
+#endif
+}
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_SOCKET_HPP_

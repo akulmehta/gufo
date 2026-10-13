@@ -4170,7 +4170,6 @@ bool Executor::RestoreSnapshot(Session& session,
       fork_transfer->Finish();
     if (snapshot_lock.owns_lock())
       snapshot_lock.unlock();
->>>>>>> v0.13.0
     session.Reset();
     return false;
   }

@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -890,6 +891,18 @@ int mkdir(const char* path, mode_t) {
   return 0;
 }
 
+int mkdirat(int dirfd, const char* path, mode_t) {
+  const std::wstring resolved = ResolveAt(dirfd, path);
+  if (resolved.empty()) {
+    errno = EBADF;
+    return -1;
+  }
+  if (!CreateDirectoryW(resolved.c_str(), nullptr)) {
+    return Fail(GetLastError());
+  }
+  return 0;
+}
+
 int access(const char* path, int mode) {
   const DWORD attributes = GetFileAttributesW(Widen(path).c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -1394,10 +1407,20 @@ unsigned long long gufo_total_physical_bytes(void) {
 
 int renameat(int olddirfd, const char* oldpath, int newdirfd,
              const char* newpath) {
+  return renameat2(olddirfd, oldpath, newdirfd, newpath, 0);
+}
+
+int renameat2(int olddirfd, const char* oldpath, int newdirfd,
+              const char* newpath, unsigned int flags) {
   const std::wstring from = ResolveAt(olddirfd, oldpath);
   const std::wstring to = ResolveAt(newdirfd, newpath);
   if (from.empty() || to.empty()) {
     errno = EBADF;
+    return -1;
+  }
+  const bool noreplace = (flags & 1 /* RENAME_NOREPLACE */) != 0;
+  if (noreplace && GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    errno = EEXIST;
     return -1;
   }
   // POSIX-semantics rename replaces the target even while another handle
@@ -1414,7 +1437,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd,
   const size_t bytes = sizeof(FILE_RENAME_INFO) + to.size() * sizeof(wchar_t);
   std::string storage(bytes, '\0');
   auto* info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-  info->Flags = 0x1 /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS */ |
+  info->Flags = (noreplace ? 0 : 0x1 /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS */) |
                 0x2 /* FILE_RENAME_FLAG_POSIX_SEMANTICS */;
   info->RootDirectory = nullptr;
   info->FileNameLength = static_cast<DWORD>(to.size() * sizeof(wchar_t));
@@ -1426,8 +1449,11 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd,
   if (renamed) {
     return 0;
   }
-  if (!MoveFileExW(from.c_str(), to.c_str(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+  DWORD move_flags = MOVEFILE_WRITE_THROUGH;
+  if (!noreplace) {
+    move_flags |= MOVEFILE_REPLACE_EXISTING;
+  }
+  if (!MoveFileExW(from.c_str(), to.c_str(), move_flags)) {
     return Fail(GetLastError());
   }
   return 0;
@@ -1742,4 +1768,99 @@ int utimensat(int dirfd, const wchar_t* path, const struct timespec times[2],
 
 int access(const wchar_t* path, int mode) {
   return access(Narrow(path).c_str(), mode);
+}
+
+// POSIX dirent implementation
+struct DIR {
+  HANDLE handle{INVALID_HANDLE_VALUE};
+  WIN32_FIND_DATAW data{};
+  struct dirent entry{};
+  bool first{true};
+  bool done{false};
+  std::wstring search_path;
+};
+
+DIR* opendir(const char* name) {
+  if (name == nullptr) {
+    errno = ENOENT;
+    return nullptr;
+  }
+  std::wstring path = ResolveAt(AT_FDCWD, name);
+  if (path.empty()) {
+    errno = ENOENT;
+    return nullptr;
+  }
+  if (path.back() != L'\\' && path.back() != L'/') {
+    path += L'\\';
+  }
+  auto* dir = new DIR();
+  dir->search_path = path + L"*";
+  return dir;
+}
+
+DIR* fdopendir(int fd) {
+  std::wstring path = DirectoryPathOf(fd);
+  if (path.empty()) {
+    errno = EBADF;
+    return nullptr;
+  }
+  if (path.back() != L'\\' && path.back() != L'/') {
+    path += L'\\';
+  }
+  auto* dir = new DIR();
+  dir->search_path = path + L"*";
+  return dir;
+}
+
+struct dirent* readdir(DIR* dir) {
+  if (dir == nullptr || dir->done) {
+    return nullptr;
+  }
+  if (dir->first) {
+    dir->first = false;
+    dir->handle = FindFirstFileW(dir->search_path.c_str(), &dir->data);
+    if (dir->handle == INVALID_HANDLE_VALUE) {
+      dir->done = true;
+      if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+        Fail(GetLastError());
+      }
+      return nullptr;
+    }
+  } else {
+    if (!FindNextFileW(dir->handle, &dir->data)) {
+      dir->done = true;
+      if (GetLastError() != ERROR_NO_MORE_FILES) {
+        Fail(GetLastError());
+      }
+      return nullptr;
+    }
+  }
+  std::string narrow = Narrow(dir->data.cFileName);
+  strncpy_s(dir->entry.d_name, sizeof(dir->entry.d_name), narrow.c_str(), _TRUNCATE);
+  dir->entry.d_ino = 1;
+  return &dir->entry;
+}
+
+int closedir(DIR* dir) {
+  if (dir == nullptr) {
+    errno = EBADF;
+    return -1;
+  }
+  if (dir->handle != INVALID_HANDLE_VALUE) {
+    FindClose(dir->handle);
+  }
+  delete dir;
+  return 0;
+}
+
+void rewinddir(DIR* dir) {
+  if (dir == nullptr) {
+    return;
+  }
+  if (dir->handle != INVALID_HANDLE_VALUE) {
+    FindClose(dir->handle);
+    dir->handle = INVALID_HANDLE_VALUE;
+  }
+  dir->first = true;
+  dir->done = false;
 }

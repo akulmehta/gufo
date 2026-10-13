@@ -6,6 +6,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -752,9 +753,15 @@ struct DiskStore::Impl {
   }
   void Rename(int target, const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
+#ifdef _WIN32
+    if (renameat2(temporary.Get(), name.c_str(), target, name.c_str(),
+                  RENAME_NOREPLACE) < 0)
+      IoError("publish cache file");
+#else
     if (syscall(SYS_renameat2, temporary.Get(), name.c_str(), target,
                 name.c_str(), RENAME_NOREPLACE) < 0)
       IoError("publish cache file");
+#endif
   }
   void WriteFile(int fd, std::span<const std::uint8_t> bytes) {
     while (!bytes.empty()) {
@@ -1457,7 +1464,7 @@ DiskReadStats DiskStore::ReadPayload(
         auto reservation =
             impl_->ledger->Reserve(ResourceCategory::kMetadata, 256);
         auto [inserted, added] =
-            impl_->verified.emplace(key, Impl::VerifiedFile{{}, identity});
+            impl_->verified.try_emplace(key, Impl::VerifiedFile{{}, identity});
         try {
           inserted->second.charge = reservation.Convert();
         } catch (...) {
